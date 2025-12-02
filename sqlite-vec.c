@@ -4219,6 +4219,8 @@ typedef struct HNSWNode
   f32 *vec;
   int nbors[MAX_LEVELS][MAX_NEIGHBORS];
   int nbor_count[MAX_LEVELS];
+
+  bool deleted;
 } HNSWNode;
 
 typedef struct
@@ -4231,7 +4233,7 @@ typedef struct
   int max_level;
 } HNSW;
 
-typedef float (*DistanceFunc)(const void *a, const void *b, const void *dims);
+typedef double (*DistanceFunc)(const void *a, const void *b, const void *dims);
 void get_distance_func(vec0_vtab *pNew);
 
 typedef enum IndexType
@@ -4304,6 +4306,8 @@ void connect_nodes(HNSWNode *a, HNSWNode *b, int level);
 HNSWNode *node_create(int id, int rowid, const f32 *vec, int dim);
 int random_level();
 void hnsw_free(HNSW *h);
+int hnsw_update(HNSW *h, int rowid, const f32 *vec, int reinsert, DistanceFunc distfunc);
+int hnsw_delete(HNSW *h, int rowid);
 int serialize_hnsw(HNSW *h, const char *path);
 HNSW *deserialize_hnsw(const char *path);
 
@@ -4349,12 +4353,15 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
 int ivf_add_vector(IVF *ivf, const f32 *vec, i64 rowid, DistanceFunc disfunc);
 int ivf_train_kmeans(IVF *ivf, const f32 *data, int n, int iters, DistanceFunc distfunc);
 IVF *ivf_create(int nlist, int nprobe, int dim);
+int ivf_delete_vector(IVF *ivf, i64 rowid);
+int ivf_update_vector_reinsert(IVF *ivf, i64 rowid, const f32 *vec, DistanceFunc distfunc);
 int serialize_ivf(IVF *ivf, const char *path);
 IVF *deserialize_ivf(const char *path);
 void ivf_free(IVF *ivf);
 
 typedef struct IndexMeta
 {
+  int dim;
   IndexType indexType;
   char *indexColumnName;
 
@@ -6413,6 +6420,7 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
         goto error;
       }
       get_distance_func(pNew);
+      pNew->indexMeta->dim = pNew->vector_columns[numVectorColumns - 1].dimensions;
       switch (pNew->indexMeta->indexType)
       {
       case SQLITE_VEC0_INDEX_TYPE_KDTREE:
@@ -6454,6 +6462,7 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
     switch (pNew->indexMeta->indexType)
     {
     case SQLITE_VEC0_INDEX_TYPE_KDTREE:
+
       snprintf(indexname, sizeof(indexname), "%s_%s_%s.idx", dbname, pNew->tableName, "kdtree");
       pNew->indexMeta->indexTree = deserialize_kdtree(indexname);
       if (!pNew->indexMeta->indexTree)
@@ -6482,6 +6491,7 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
     }
 
     get_distance_func(pNew);
+    pNew->indexMeta->dim = pNew->vector_columns[numVectorColumns - 1].dimensions;
   }
 
   *ppVtab = (sqlite3_vtab *)pNew;
@@ -6654,6 +6664,19 @@ static int vec0Destroy(sqlite3_vtab *pVtab)
     }
   }
 
+  if (p->hasIndex)
+  {
+    {
+      char dbname[128];
+      get_db_basename(p->db, "main", dbname, sizeof(dbname));
+      char indexname[128];
+      snprintf(indexname, sizeof(indexname), "%s_%s_%s.idx", dbname, p->tableName, "kdtree");
+      if (remove(indexname) != 0)
+      {
+        vtab_set_error(pVtab, "could not delete .idx file");
+      }
+    }
+  }
   stmt = NULL;
   rc = SQLITE_OK;
 
@@ -10728,7 +10751,20 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue)
   {
     if (rowid)
     {
-      kdtree_delete(p->indexMeta->indexTree, rowid);
+      switch (p->indexMeta->indexType)
+      {
+      case SQLITE_VEC0_INDEX_TYPE_KDTREE:
+        kdtree_delete(p->indexMeta->indexTree, rowid);
+        break;
+      case SQLITE_VEC0_INDEX_TYPE_HNSW:
+        hnsw_delete(p->indexMeta->indexHNSW, rowid);
+        break;
+      case SQLITE_VEC0_INDEX_TYPE_IVF:
+        ivf_delete_vector(p->indexMeta->indexIVF, rowid);
+        break;
+      default:
+        break;
+      }
     }
   }
 
@@ -10852,15 +10888,14 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv)
   UNUSED_PARAMETER(argc);
   vec0_vtab *p = (vec0_vtab *)pVTab;
   int rc;
-  i64 chunk_id;
-  i64 chunk_offset;
-
+  i64 chunk_id, chunk_offset;
   i64 rowid;
+
+  // 1) 获取 rowid
   if (p->pkIsText)
   {
     const char *a = (const char *)sqlite3_value_text(argv[0]);
     const char *b = (const char *)sqlite3_value_text(argv[1]);
-    // IMP: V08886_25725
     if ((sqlite3_value_bytes(argv[0]) != sqlite3_value_bytes(argv[1])) ||
         strncmp(a, b, sqlite3_value_bytes(argv[0])) != 0)
     {
@@ -10870,107 +10905,104 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv)
     }
     rc = vec0_rowid_from_id(p, argv[0], &rowid);
     if (rc != SQLITE_OK)
-    {
       return rc;
-    }
   }
   else
   {
     rowid = sqlite3_value_int64(argv[0]);
   }
 
-  // 1) get chunk_id and chunk_offset from _rowids
+  // 2) 获取 chunk_id 和 chunk_offset
   rc = vec0_get_chunk_position(p, rowid, NULL, &chunk_id, &chunk_offset);
   if (rc != SQLITE_OK)
-  {
     return rc;
-  }
 
-  // 2) update any partition key values
+  // 3) 更新分区键列（暂不支持）
   for (int i = 0; i < vec0_num_defined_user_columns(p); i++)
   {
     if (p->user_column_kinds[i] != SQLITE_VEC0_USER_COLUMN_KIND_PARTITION)
-    {
       continue;
-    }
     sqlite3_value *value = argv[2 + VEC0_COLUMN_USERN_START + i];
     if (sqlite3_value_nochange(value))
-    {
       continue;
-    }
-    vtab_set_error(pVTab, "UPDATE on partition key columns are not supported yet. ");
+    vtab_set_error(pVTab, "UPDATE on partition key columns are not supported yet.");
     return SQLITE_ERROR;
   }
 
-  // 3) handle auxiliary column updates
+  // 4) 更新辅助列
   for (int i = 0; i < vec0_num_defined_user_columns(p); i++)
   {
     if (p->user_column_kinds[i] != SQLITE_VEC0_USER_COLUMN_KIND_AUXILIARY)
-    {
       continue;
-    }
-    int auxiliary_column_idx = p->user_column_idxs[i];
+    int aux_idx = p->user_column_idxs[i];
     sqlite3_value *value = argv[2 + VEC0_COLUMN_USERN_START + i];
     if (sqlite3_value_nochange(value))
-    {
       continue;
-    }
-    rc = vec0Update_UpdateAuxColumn(p, auxiliary_column_idx, value, rowid);
+    rc = vec0Update_UpdateAuxColumn(p, aux_idx, value, rowid);
     if (rc != SQLITE_OK)
-    {
-      return SQLITE_ERROR;
-    }
+      return rc;
   }
 
-  // 4) handle metadata column updates
+  // 5) 更新元数据列
   for (int i = 0; i < vec0_num_defined_user_columns(p); i++)
   {
     if (p->user_column_kinds[i] != SQLITE_VEC0_USER_COLUMN_KIND_METADATA)
-    {
       continue;
-    }
-    int metadata_column_idx = p->user_column_idxs[i];
+    int meta_idx = p->user_column_idxs[i];
     sqlite3_value *value = argv[2 + VEC0_COLUMN_USERN_START + i];
     if (sqlite3_value_nochange(value))
-    {
       continue;
-    }
-    rc = vec0_write_metadata_value(p, metadata_column_idx, rowid, chunk_id, chunk_offset, value, 1);
+    rc = vec0_write_metadata_value(p, meta_idx, rowid, chunk_id, chunk_offset, value, 1);
     if (rc != SQLITE_OK)
-    {
       return rc;
-    }
   }
 
-  // 5) iterate over all new vectors, update the vectors
+  // 6) 更新向量列，并同步索引
   for (int i = 0; i < vec0_num_defined_user_columns(p); i++)
   {
     if (p->user_column_kinds[i] != SQLITE_VEC0_USER_COLUMN_KIND_VECTOR)
-    {
       continue;
-    }
-    int vector_idx = p->user_column_idxs[i];
-    sqlite3_value *valueVector = argv[2 + VEC0_COLUMN_USERN_START + i];
-    // in vec0Column, we check sqlite3_vtab_nochange() on vector columns.
-    // If the vector column isn't being changed, we return NULL;
-    // That's not great, that means vector columns can never be NULLABLE
-    // (bc we cant distinguish if an updated vector is truly NULL or nochange).
-    // Also it means that if someone tries to run `UPDATE v SET X = NULL`,
-    // we can't effectively detect and raise an error.
-    // A better solution would be to use a custom result_type for "empty",
-    // but subtypes don't appear to survive xColumn -> xUpdate, it's always 0.
-    // So for now, we'll just use NULL and warn people to not SET X = NULL
-    // in the docs.
-    if (sqlite3_value_type(valueVector) == SQLITE_NULL)
-    {
-      continue;
-    }
 
-    rc = vec0Update_UpdateVectorColumn(p, chunk_id, chunk_offset, vector_idx,
-                                       valueVector);
-    if (rc != SQLITE_OK)
+    int vec_idx = p->user_column_idxs[i];
+    sqlite3_value *valueVector = argv[2 + VEC0_COLUMN_USERN_START + i];
+    if (sqlite3_value_type(valueVector) == SQLITE_NULL)
+      continue;
+
+    // 从 sqlite3_value 获取向量
+    void *vec;
+    enum VectorElementType elementType;
+    vector_cleanup cleanup = vector_cleanup_noop;
+    char *pzError;
+
+    vector_from_value(valueVector, &vec, &p->vector_columns[i].dimensions, &elementType, &cleanup, &pzError);
+    if (pzError)
     {
+      vtab_set_error(pVTab, pzError);
+      cleanup(vec);
       return SQLITE_ERROR;
+    }
+    // 先更新向量列
+    rc = vec0Update_UpdateVectorColumn(p, chunk_id, chunk_offset, vec_idx, valueVector);
+    if (rc != SQLITE_OK)
+      return rc;
+
+    // 同步索引
+    if (p->hasIndex && p->indexMeta)
+    {
+      switch (p->indexMeta->indexType)
+      {
+      case SQLITE_VEC0_INDEX_TYPE_HNSW:
+        hnsw_update(p->indexMeta->indexHNSW, rowid, vec, true, p->indexMeta->distfunc);
+        break;
+      case SQLITE_VEC0_INDEX_TYPE_KDTREE:
+        kdtree_update(p->indexMeta->indexTree, rowid, vec, p->indexMeta->dim);
+        break;
+      case SQLITE_VEC0_INDEX_TYPE_IVF:
+        ivf_update_vector_reinsert(p->indexMeta->indexIVF, rowid, vec, p->indexMeta->distfunc);
+        break;
+      default:
+        break;
+      }
     }
   }
 
@@ -12044,7 +12076,7 @@ sqlite3_vec_static_blobs_init(sqlite3 *db, char **pzErrMsg,
   return rc;
 }
 
-typedef float (*DistanceFunc)(const void *a, const void *b, const void *dims);
+typedef double (*DistanceFunc)(const void *a, const void *b, const void *dims);
 
 void get_distance_func(vec0_vtab *pNew)
 {
@@ -12180,7 +12212,8 @@ void kd_print_node(KDNode *node, int depth, int dims)
       printf(", ");
   }
   printf("]\n");
-
+  if (node->deleted)
+    printf("(deleted)\n");
   kd_print_node(node->left, depth + 1, dims);
   kd_print_node(node->right, depth + 1, dims);
 }
@@ -12270,6 +12303,19 @@ int kdtree_topk(KDTree *tree, const float *query, int k,
   return k_used;
 }
 
+int kdtree_update(KDTree *tree, sqlite3_int64 rowid, float *new_point, int dims)
+{
+  if (tree == NULL || tree->root == NULL)
+    return SQLITE_ERROR;
+
+  int rc = kdtree_delete(tree, rowid);
+  if (rc != SQLITE_OK)
+    return rc;
+
+  rc = kdtree_insert(tree, new_point, rowid, dims);
+  return rc;
+}
+
 int kdtree_delete(KDTree *tree, int rowid)
 {
   if (!tree || !tree->root)
@@ -12345,7 +12391,6 @@ KDNode *build_balanced(PointRec *arr, int l, int r, int depth, int dims)
   current_axis = axis;
   cur_dims = dims;
   int len = r - l;
-  /* sort range by axis (simple) */
   qsort(arr + l, len, sizeof(PointRec), pointrec_cmp);
   int mid = l + len / 2;
 
@@ -12495,6 +12540,7 @@ HNSWNode *node_create(int id, int rowid, const f32 *vec, int dim)
   HNSWNode *n = sqlite3_malloc(sizeof(HNSWNode));
   n->id = id;
   n->rowid = rowid;
+  n->deleted = false;
   n->level = random_level();
   n->vec = sqlite3_malloc(sizeof(f32) * dim);
   memcpy(n->vec, vec, sizeof(f32) * dim);
@@ -12529,6 +12575,9 @@ int hnsw_add(HNSW *h, const f32 *vec, int rowid, DistanceFunc distfunc)
   for (int l = h->max_level; l > n->level; l--)
   {
     HNSWNode *ep = h->nodes[cur_entry];
+    if (ep->deleted)
+      continue;
+
     f32 dist_best = distfunc(ep->vec, n->vec, &h->dim);
     int improved = 1;
     while (improved && ep->nbor_count[l] > 0)
@@ -12538,6 +12587,8 @@ int hnsw_add(HNSW *h, const f32 *vec, int rowid, DistanceFunc distfunc)
       {
         int nid = ep->nbors[l][i];
         HNSWNode *neighbor = h->nodes[nid];
+        if (neighbor->deleted)
+          continue;
         f32 d = distfunc(neighbor->vec, n->vec, &h->dim);
         if (d < dist_best)
         {
@@ -12561,10 +12612,8 @@ int hnsw_add(HNSW *h, const f32 *vec, int rowid, DistanceFunc distfunc)
 
     for (int i = 0; i < h->num_nodes; i++)
     {
-      if (h->nodes[i] == NULL)
-        continue;
       HNSWNode *cand = h->nodes[i];
-      if (cand->level < l || cand->id == n->id)
+      if (!cand || cand->deleted || cand->level < l || cand->id == n->id)
         continue;
       candidates[cand_count].id = cand->id;
       candidates[cand_count].dist = distfunc(n->vec, cand->vec, &h->dim);
@@ -12592,6 +12641,7 @@ int hnsw_add(HNSW *h, const f32 *vec, int rowid, DistanceFunc distfunc)
       connect_nodes(h->nodes[nid], n, l);
     }
   }
+
   if (n->level > h->max_level)
   {
     h->max_level = n->level;
@@ -12605,6 +12655,10 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
 {
   int ep = h->entry_id;
   HNSWNode *cur = h->nodes[ep];
+  while (cur->deleted && ep < h->num_nodes)
+  {
+    cur = h->nodes[++ep];
+  }
   f32 cur_dist = dist_func(cur->vec, query, &h->dim);
 
   for (int l = h->max_level; l > 0; l--)
@@ -12616,6 +12670,8 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
       for (int i = 0; i < cur->nbor_count[l]; i++)
       {
         HNSWNode *n2 = h->nodes[cur->nbors[l][i]];
+        if (n2->deleted)
+          continue; // 忽略删除节点
         f32 d = dist_func(n2->vec, query, &h->dim);
         if (d < cur_dist)
         {
@@ -12631,6 +12687,7 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
   memset(visited, 0, sizeof(visited));
   int q[h->num_nodes];
   int qh = 0, qt = 0;
+
   q[qt++] = cur->id;
   visited[cur->id] = 1;
 
@@ -12638,13 +12695,16 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
   while (qh < qt && results < ef)
   {
     HNSWNode *n = h->nodes[q[qh++]];
+    if (n->deleted)
+      continue; // 忽略删除节点
     f32 d = dist_func(n->vec, query, &h->dim);
     out_ids[results] = n->rowid;
     out_dists[results++] = d;
+
     for (int i = 0; i < n->nbor_count[0]; i++)
     {
       int nid = n->nbors[0][i];
-      if (!visited[nid])
+      if (!visited[nid] && !h->nodes[nid]->deleted)
       {
         visited[nid] = 1;
         q[qt++] = nid;
@@ -12652,6 +12712,7 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
     }
   }
 
+  // 排序 topk
   for (int i = 0; i < results; i++)
   {
     for (int j = i + 1; j < results; j++)
@@ -12667,9 +12728,48 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
       }
     }
   }
+
   if (results > topk)
     results = topk;
   return results;
+}
+
+int hnsw_delete(HNSW *h, int rowid)
+{
+  for (int i = 0; i < h->num_nodes; i++)
+  {
+    HNSWNode *node = h->nodes[i];
+    if (node && node->rowid == rowid && !node->deleted)
+    {
+      node->deleted = 1;
+      return SQLITE_OK;
+    }
+  }
+  return SQLITE_OK;
+}
+
+int hnsw_update(HNSW *h, int rowid, const f32 *vec, int reinsert, DistanceFunc distfunc)
+{
+  for (int i = 0; i < h->num_nodes; i++)
+  {
+    HNSWNode *node = h->nodes[i];
+    if (node && node->rowid == rowid && !node->deleted)
+    {
+      if (!reinsert)
+      {
+
+        memcpy(node->vec, vec, sizeof(f32) * h->dim);
+        return SQLITE_OK;
+      }
+      else
+      {
+        node->deleted = 1;
+        return hnsw_add(h, vec, rowid, distfunc);
+      }
+    }
+  }
+
+  return SQLITE_OK;
 }
 
 void hnsw_print(HNSW *h)
@@ -12677,22 +12777,31 @@ void hnsw_print(HNSW *h)
   if (!h)
     return;
 
-  printf("HNSW Graph: num_nodes=%d, max_level=%d, entry_rowid=%d\n",
+  printf("HNSW Graph: num_nodes=%d, max_level=%d, entry_id=%d\n",
          h->num_nodes, h->max_level, h->entry_id);
 
   for (int i = 0; i < h->num_nodes; i++)
   {
     HNSWNode *n = h->nodes[i];
-    if (!n)
+    if (!n || n->deleted)
       continue;
 
-    printf("Node %d (level %d):\n", n->id, n->level);
+    printf("Node %d (level %d, rowid=%d, embedding=[", n->id, n->level, n->rowid);
+    for (int j = 0; j < h->dim; j++)
+    {
+      printf("%f", n->vec[j]);
+      if (j < h->dim - 1)
+        printf(", ");
+    }
+    printf("]):\n");
     for (int l = n->level; l >= 0; l--)
     {
       printf("  Level %d neighbors: ", l);
       for (int j = 0; j < n->nbor_count[l]; j++)
       {
-        printf("%d ", n->nbors[l][j]);
+        HNSWNode *neighbor = h->nodes[n->nbors[l][j]];
+        if (neighbor && !neighbor->deleted)
+          printf("%d ", neighbor->id);
       }
       printf("\n");
     }
@@ -13108,6 +13217,75 @@ int ivf_train_and_flush(IVF *ivf, DistanceFunc distfunc)
   return SQLITE_OK;
 }
 
+int ivf_delete_vector(IVF *ivf, i64 rowid)
+{
+  if (!ivf)
+    return -1;
+  if (!ivf->trained)
+    return -1;
+  
+  int dim = ivf->dim;
+
+  // 遍历所有 inverted lists
+  for (int l = 0; l < ivf->nlist; l++)
+  {
+    InvertedList *lst = &ivf->lists[l];
+
+    for (int i = 0; i < lst->count; i++)
+    {
+      if (lst->rowids[i] == rowid)
+      {
+
+        int last = lst->count - 1;
+
+        // 覆盖删除
+        lst->rowids[i] = lst->rowids[last];
+        memcpy(&lst->vecs[i * dim],
+               &lst->vecs[last * dim],
+               sizeof(f32) * dim);
+
+        lst->count--;
+        return l; // 返回旧 list_id
+      }
+    }
+  }
+  return -1; // 未找到
+}
+
+int ivf_update_vector_reinsert(IVF *ivf, i64 rowid, const f32 *vec, DistanceFunc distfunc)
+{
+  if (!ivf->trained)
+    return SQLITE_OK;
+
+  size_t dim = ivf->dim;
+
+  int old_list = ivf_delete_vector(ivf, rowid);
+  if (old_list < 0)
+    return SQLITE_OK;
+
+  float min_dist = 1e30f;
+  int new_list = 0;
+  for (int l = 0; l < ivf->nlist; l++)
+  {
+    float dist = distfunc(vec, &ivf->centroids[l * dim], &dim);
+    if (dist < min_dist)
+    {
+      min_dist = dist;
+      new_list = l;
+    }
+  }
+
+  InvertedList *lst = &ivf->lists[new_list];
+  if (lst->count >= lst->cap)
+    return SQLITE_NOMEM;
+
+  lst->rowids[lst->count] = rowid;
+  memcpy(&lst->vecs[lst->count * dim], vec, sizeof(f32) * dim);
+  lst->count++;
+
+  return SQLITE_OK;
+}
+
 int serialize_kdnode(FILE *fp, KDNode *node, int dims)
 {
   if (!node)
@@ -13223,6 +13401,27 @@ void free_kdtree(KDTree *tree)
   sqlite3_free(tree);
 }
 
+float *kdtree_find_vector_by_rowid_rec(KDNode *node, sqlite3_int64 rowid)
+{
+  if (!node)
+    return NULL;
+  if (!node->deleted && node->rowid == rowid)
+    return node->point;
+
+  // 递归左右子树
+  float *res = kdtree_find_vector_by_rowid_rec(node->left, rowid);
+  if (res)
+    return res;
+  return kdtree_find_vector_by_rowid_rec(node->right, rowid);
+}
+
+float *kdtree_find_vector_by_rowid(KDTree *tree, sqlite3_int64 rowid)
+{
+  if (!tree)
+    return NULL;
+  return kdtree_find_vector_by_rowid_rec(tree->root, rowid);
+}
+
 int serialize_hnsw(HNSW *h, const char *path)
 {
   FILE *fp = fopen(path, "wb");
@@ -13242,7 +13441,7 @@ int serialize_hnsw(HNSW *h, const char *path)
     fwrite(&n->id, sizeof(int), 1, fp);
     fwrite(&n->rowid, sizeof(int), 1, fp);
     fwrite(&n->level, sizeof(int), 1, fp);
-
+    fwrite(&n->deleted, sizeof(int), 1, fp);
     fwrite(n->vec, sizeof(float), h->dim, fp);
 
     for (int lvl = 0; lvl <= n->level; lvl++)
@@ -13290,7 +13489,7 @@ HNSW *deserialize_hnsw(const char *path)
     fread(&n->id, sizeof(int), 1, fp);
     fread(&n->rowid, sizeof(int), 1, fp);
     fread(&n->level, sizeof(int), 1, fp);
-
+    fread(&n->deleted, sizeof(int), 1, fp);
     n->vec = sqlite3_malloc(sizeof(float) * dim);
     fread(n->vec, sizeof(float), dim, fp);
 
