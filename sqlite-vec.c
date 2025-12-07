@@ -4171,15 +4171,6 @@ static sqlite3_module vec_npy_eachModule = {
 
 typedef struct vec0_vtab vec0_vtab;
 
-#define VEC0_MAX_VECTOR_COLUMNS 16
-#define VEC0_MAX_PARTITION_COLUMNS 4
-#define VEC0_MAX_AUXILIARY_COLUMNS 16
-#define VEC0_MAX_METADATA_COLUMNS 16
-
-#define SQLITE_VEC_VEC0_MAX_DIMENSIONS 8192
-#define VEC0_METADATA_TEXT_VIEW_BUFFER_LENGTH 16
-#define VEC0_METADATA_TEXT_VIEW_DATA_LENGTH 12
-
 typedef enum
 {
   // vector column, ie "contents_embedding float[1024]"
@@ -4194,6 +4185,34 @@ typedef enum
   // metadata column that can be filtered, ie "genre text"
   SQLITE_VEC0_USER_COLUMN_KIND_METADATA = 4,
 } vec0_user_column_kind;
+
+// by zxr
+#define VEC0_MAX_VECTOR_COLUMNS 16
+#define VEC0_MAX_PARTITION_COLUMNS 4
+#define VEC0_MAX_AUXILIARY_COLUMNS 16
+#define VEC0_MAX_METADATA_COLUMNS 16
+
+#define SQLITE_VEC_VEC0_MAX_DIMENSIONS 8192
+#define VEC0_METADATA_TEXT_VIEW_BUFFER_LENGTH 16
+#define VEC0_METADATA_TEXT_VIEW_DATA_LENGTH 12
+
+typedef struct
+{
+  i64 *rowids;
+  int capacity;
+  int count;
+} RowidMap;
+
+static int cmp_i64(const void *a, const void *b)
+{
+  i64 x = *(const i64 *)a;
+  i64 y = *(const i64 *)b;
+  if (x < y)
+    return -1;
+  if (x > y)
+    return 1;
+  return 0;
+}
 
 // kdtree-局部rebuild参数
 #define ALPHA_BAL 0.75f /* if left or right > ALPHA_BAL * size -> unbalanced */
@@ -4317,11 +4336,11 @@ KDNode *kdtree_insert_rec(KDNode *node, float *point, sqlite3_int64 rowid,
                           int depth, int dims);
 int kdtree_insert(KDTree *tree, float *point, sqlite3_int64 rowid, int dims);
 int kdtree_topk(KDTree *tree, const float *query, int k,
-                sqlite3_int64 *rowids_out, float *dists_out, DistanceFunc distfunc);
+                sqlite3_int64 *rowids_out, float *dists_out, RowidMap *map, DistanceFunc distfunc);
 void topk_insert(sqlite3_int64 *rowids, float *dists, int *k_used,
                  int k, sqlite3_int64 rowid, float dist2);
 void kdtree_search_topk_rec(KDNode *node, const float *query, int dims,
-                            int k, sqlite3_int64 *rowids, float *dists, int *k_used, DistanceFunc distfunc);
+                            int k, sqlite3_int64 *rowids, float *dists, int *k_used, RowidMap *map, DistanceFunc distfunc);
 KDNode *kdtree_find_min(KDNode *node, int axis, int depth, int dims);
 KDNode *kdtree_delete_rec(KDNode *node, int rowid, int depth, int dims);
 int kdtree_delete(KDTree *tree, int rowid);
@@ -4397,6 +4416,16 @@ void get_db_basename(sqlite3 *db, const char *db_alias, char *out, size_t out_si
   if (dot)
     *dot = '\0';
 }
+
+int vec0Filter_chunks_to_rowid_map(
+    vec0_vtab *p,
+    sqlite3_stmt *stmtChunks,
+    struct Array *arrayRowidsIn,
+    struct Array *aMetadataIn,
+    const char *idxStr,
+    int argc,
+    sqlite3_value **argv,
+    RowidMap *out_map);
 
 /**
  * @brief The virtual table for vec0.
@@ -8338,7 +8367,7 @@ int vec0Filter_knn_chunks_iter(vec0_vtab *p, sqlite3_stmt *stmtChunks,
       goto cleanup;
     }
 
-    bitmap_copy(b, chunkValidity, p->chunk_size);
+    bitmap_copy(b, chunkValidity, p->chunk_size); //(dest, src, size)
     if (arrayRowidsIn)
     {
       bitmap_clear(bmRowids, p->chunk_size);
@@ -8812,7 +8841,38 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
   }
 #endif
 
-  if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_KDTREE && rowid_in_idx < 0 && !hasMetadataIn && !hasMetadataFilters)
+  rc = vec0_chunks_iter(p, idxStr, argc, argv, &stmtChunks);
+
+  if (rc != SQLITE_OK)
+  {
+    // IMP: V06942_23781
+    vtab_set_error(&p->base, "Error preparing stmtChunk: %s",
+                   sqlite3_errmsg(p->db));
+    goto cleanup;
+  }
+
+  RowidMap *out_map;
+  out_map = sqlite3_malloc(sizeof(RowidMap));
+  if (!out_map)
+  {
+    rc = SQLITE_NOMEM;
+    goto cleanup;
+  }
+  out_map->capacity = 16; // 初始化值，在add函数中动态扩容。
+  out_map->count = 0;
+  out_map->rowids = sqlite3_malloc(sizeof(i64) * out_map->capacity);
+  if (!out_map->rowids)
+  {
+    rc = SQLITE_NOMEM;
+    goto cleanup;
+  }
+  rc = vec0Filter_chunks_to_rowid_map(p, stmtChunks, arrayRowidsIn, aMetadataIn, idxStr, argc, argv, out_map);
+  if (rc != SQLITE_OK && rc != SQLITE_DONE)
+  {
+    goto cleanup;
+  }
+
+  if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_KDTREE)
   {
     i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
     f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
@@ -8823,7 +8883,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     }
 
     int n_found = kdtree_topk(p->indexMeta->indexTree, queryVector, k,
-                              topk_rowids, topk_distances, p->indexMeta->distfunc);
+                              topk_rowids, topk_distances, out_map, p->indexMeta->distfunc);
 
     knn_data->current_idx = 0;
     knn_data->k = k;
@@ -8836,7 +8896,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     rc = SQLITE_OK;
     goto cleanup;
   }
-  else if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_HNSW && rowid_in_idx < 0 && !hasMetadataIn && !hasMetadataFilters)
+  else if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_HNSW)
   {
     i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * EF_CONSTRUCTION);
     f32 *topk_distances = sqlite3_malloc(sizeof(f32) * EF_CONSTRUCTION);
@@ -8865,7 +8925,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     rc = SQLITE_OK;
     goto cleanup;
   }
-  else if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_IVF && p->indexMeta->indexIVF->trained && rowid_in_idx < 0 && !hasMetadataIn && !hasMetadataFilters)
+  else if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_IVF)
   {
 
     i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
@@ -8899,37 +8959,28 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
   }
   else
   {
+    i64 *topk_rowids = NULL;
+    f32 *topk_distances = NULL;
+    i64 k_used = 0;
+
+    rc = vec0Filter_knn_chunks_iter(p, stmtChunks, vector_column, vectorColumnIdx,
+                                    arrayRowidsIn, aMetadataIn, idxStr, argc, argv, queryVector, k, &topk_rowids,
+                                    &topk_distances, &k_used);
+    if (rc != SQLITE_OK)
+    {
+      goto cleanup;
+    }
+
+    knn_data->current_idx = 0;
+    knn_data->k = k;
+    knn_data->rowids = topk_rowids;
+    knn_data->distances = topk_distances;
+    knn_data->k_used = k_used;
+
+    pCur->knn_data = knn_data;
+    pCur->query_plan = VEC0_QUERY_PLAN_KNN;
+    rc = SQLITE_OK;
   }
-
-  rc = vec0_chunks_iter(p, idxStr, argc, argv, &stmtChunks);
-  if (rc != SQLITE_OK)
-  {
-    // IMP: V06942_23781
-    vtab_set_error(&p->base, "Error preparing stmtChunk: %s",
-                   sqlite3_errmsg(p->db));
-    goto cleanup;
-  }
-
-  i64 *topk_rowids = NULL;
-  f32 *topk_distances = NULL;
-  i64 k_used = 0;
-  rc = vec0Filter_knn_chunks_iter(p, stmtChunks, vector_column, vectorColumnIdx,
-                                  arrayRowidsIn, aMetadataIn, idxStr, argc, argv, queryVector, k, &topk_rowids,
-                                  &topk_distances, &k_used);
-  if (rc != SQLITE_OK)
-  {
-    goto cleanup;
-  }
-
-  knn_data->current_idx = 0;
-  knn_data->k = k;
-  knn_data->rowids = topk_rowids;
-  knn_data->distances = topk_distances;
-  knn_data->k_used = k_used;
-
-  pCur->knn_data = knn_data;
-  pCur->query_plan = VEC0_QUERY_PLAN_KNN;
-  rc = SQLITE_OK;
 
 cleanup:
   sqlite3_finalize(stmtChunks);
@@ -12286,7 +12337,7 @@ void topk_insert(sqlite3_int64 *rowids, float *dists, int *k_used,
 }
 
 void kdtree_search_topk_rec(KDNode *node, const float *query, int dims,
-                            int k, sqlite3_int64 *rowids, float *dists, int *k_used, DistanceFunc distfunc)
+                            int k, sqlite3_int64 *rowids, float *dists, int *k_used, RowidMap *map, DistanceFunc distfunc)
 {
   if (!node)
     return;
@@ -12295,13 +12346,16 @@ void kdtree_search_topk_rec(KDNode *node, const float *query, int dims,
   {
     size_t dims_t = dims;
     float dist2 = distfunc(query, node->point, &dims_t);
-    topk_insert(rowids, dists, k_used, k, node->rowid, dist2);
+    // 检查 rowid 是否在 map 中
+    int valid = bsearch(&node->rowid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
+    if (valid)
+      topk_insert(rowids, dists, k_used, k, node->rowid, dist2);
   }
 
   KDNode *near = (query[node->axis] < node->point[node->axis]) ? node->left : node->right;
   KDNode *far = (query[node->axis] < node->point[node->axis]) ? node->right : node->left;
 
-  kdtree_search_topk_rec(near, query, dims, k, rowids, dists, k_used, distfunc);
+  kdtree_search_topk_rec(near, query, dims, k, rowids, dists, k_used, map, distfunc);
 
   float diff = query[node->axis] - node->point[node->axis];
   float maxDist2 = FLT_MAX;
@@ -12314,18 +12368,18 @@ void kdtree_search_topk_rec(KDNode *node, const float *query, int dims,
   }
   if (diff * diff < maxDist2)
   {
-    kdtree_search_topk_rec(far, query, dims, k, rowids, dists, k_used, distfunc);
+    kdtree_search_topk_rec(far, query, dims, k, rowids, dists, k_used, map, distfunc);
   }
 }
 
 int kdtree_topk(KDTree *tree, const float *query, int k,
-                sqlite3_int64 *rowids_out, float *dists_out, DistanceFunc distfunc)
+                sqlite3_int64 *rowids_out, float *dists_out, RowidMap *map, DistanceFunc distfunc)
 {
   if (!tree || !tree->root || k <= 0)
     return 0;
   int k_used = 0;
   kdtree_search_topk_rec(tree->root, query, tree->dimensions, k,
-                         rowids_out, dists_out, &k_used, distfunc);
+                         rowids_out, dists_out, &k_used, map, distfunc);
   return k_used;
 }
 
@@ -12721,6 +12775,7 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
     HNSWNode *n = h->nodes[q[qh++]];
     if (n->deleted)
       continue; // 忽略删除节点
+
     f32 d = dist_func(n->vec, query, &h->dim);
     out_ids[results] = n->rowid;
     out_dists[results++] = d;
@@ -13656,4 +13711,184 @@ IVF *deserialize_ivf(const char *path)
 
   fclose(f);
   return ivf;
+}
+
+// 用于解决knn搜索的过滤问题，将chunk中的有效rowid收集
+static int rowid_map_add(RowidMap *map, i64 rowid)
+{
+  if (map->count >= map->capacity)
+  {
+    int new_capacity = map->capacity * 2 + 16;
+    i64 *new_rowids = sqlite3_realloc(map->rowids, sizeof(i64) * new_capacity);
+    if (!new_rowids)
+      return SQLITE_NOMEM;
+    map->rowids = new_rowids;
+    map->capacity = new_capacity;
+  }
+  map->rowids[map->count++] = rowid;
+  return SQLITE_OK;
+}
+
+int vec0Filter_chunks_to_rowid_map(
+    vec0_vtab *p,
+    sqlite3_stmt *stmtChunks,
+    struct Array *arrayRowidsIn,
+    struct Array *aMetadataIn,
+    const char *idxStr,
+    int argc,
+    sqlite3_value **argv,
+    RowidMap *out_map)
+{
+  int rc = SQLITE_OK;
+
+  u8 *b = bitmap_new(p->chunk_size);
+  if (!b)
+    return SQLITE_NOMEM;
+
+  u8 *bmRowids = arrayRowidsIn ? bitmap_new(p->chunk_size) : NULL;
+  if (arrayRowidsIn && !bmRowids)
+  {
+    sqlite3_free(b);
+    return SQLITE_NOMEM;
+  }
+
+  u8 *bmMetadata = bitmap_new(p->chunk_size);
+  if (!bmMetadata)
+  {
+    sqlite3_free(b);
+    sqlite3_free(bmRowids);
+    return SQLITE_NOMEM;
+  }
+
+  sqlite3_blob *metadataBlobs[VEC0_MAX_METADATA_COLUMNS];
+  memset(metadataBlobs, 0, sizeof(metadataBlobs));
+
+  int idxStrLength = strlen(idxStr);
+  int numValueEntries = (idxStrLength - 1) / 4;
+  assert(numValueEntries == argc);
+  int hasMetadataFilters = 0;
+  for (int i = 0; i < argc; i++)
+  {
+    int idx = 1 + i * 4;
+    char kind = idxStr[idx];
+    if (kind == VEC0_IDXSTR_KIND_METADATA_CONSTRAINT)
+    {
+      hasMetadataFilters = 1;
+      break;
+    }
+  }
+
+  while (true)
+  {
+    rc = sqlite3_step(stmtChunks);
+    if (rc == SQLITE_DONE)
+      break;
+    if (rc != SQLITE_ROW)
+    {
+      vtab_set_error(&p->base, "chunks iter error");
+      rc = SQLITE_ERROR;
+      goto cleanup;
+    }
+
+    bitmap_clear(b, p->chunk_size);
+
+    i64 chunk_id = sqlite3_column_int64(stmtChunks, 0);
+    unsigned char *chunkValidity = (unsigned char *)sqlite3_column_blob(stmtChunks, 1);
+    i64 validitySize = sqlite3_column_bytes(stmtChunks, 1);
+    if (validitySize != p->chunk_size / CHAR_BIT)
+    {
+      vtab_set_error(&p->base, "chunk validity size doesn't match");
+      rc = SQLITE_ERROR;
+      goto cleanup;
+    }
+
+    i64 *chunkRowids = (i64 *)sqlite3_column_blob(stmtChunks, 2);
+    i64 rowidsSize = sqlite3_column_bytes(stmtChunks, 2);
+    if (rowidsSize != p->chunk_size * sizeof(i64))
+    {
+      vtab_set_error(&p->base, "chunk rowids size doesn't match");
+      rc = SQLITE_ERROR;
+      goto cleanup;
+    }
+
+    // 初始化有效位图
+    bitmap_copy(b, chunkValidity, p->chunk_size);
+
+    // 处理 arrayRowidsIn 过滤
+    if (arrayRowidsIn)
+    {
+      bitmap_clear(bmRowids, p->chunk_size);
+      for (int i = 0; i < p->chunk_size; i++)
+      {
+        if (!bitmap_get(chunkValidity, i))
+          continue;
+        i64 rowid = chunkRowids[i];
+        void *in = bsearch(&rowid, arrayRowidsIn->z, arrayRowidsIn->length, sizeof(i64), _cmp);
+        bitmap_set(bmRowids, i, in ? 1 : 0);
+      }
+      bitmap_and_inplace(b, bmRowids, p->chunk_size);
+    }
+
+    // 处理 metadata 过滤
+    if (hasMetadataFilters)
+    {
+      for (int i = 0; i < argc; i++)
+      {
+        int idx = 1 + i * 4;
+        char kind = idxStr[idx];
+        if (kind != VEC0_IDXSTR_KIND_METADATA_CONSTRAINT)
+          continue;
+        int metadata_idx = idxStr[idx + 1] - 'A';
+        int operator = idxStr[idx + 2];
+
+        if (!metadataBlobs[metadata_idx])
+        {
+          rc = sqlite3_blob_open(p->db, p->schemaName,
+                                 p->shadowMetadataChunksNames[metadata_idx],
+                                 "data", chunk_id, 0,
+                                 &metadataBlobs[metadata_idx]);
+          if (rc != SQLITE_OK)
+          {
+            vtab_set_error(&p->base, "Could not open metadata blob");
+            goto cleanup;
+          }
+        }
+
+        bitmap_clear(bmMetadata, p->chunk_size);
+        rc = vec0_set_metadata_filter_bitmap(
+            p, metadata_idx, operator, argv[i],
+            metadataBlobs[metadata_idx], chunk_id,
+            bmMetadata, p->chunk_size, aMetadataIn, i);
+        if (rc != SQLITE_OK)
+        {
+          vtab_set_error(&p->base, "Could not filter metadata fields");
+          goto cleanup;
+        }
+        bitmap_and_inplace(b, bmMetadata, p->chunk_size);
+      }
+    }
+
+    // 将有效 rowid 放入 map
+    for (int i = 0; i < p->chunk_size; i++)
+    {
+      if (bitmap_get(b, i))
+      {
+        rc = rowid_map_add(out_map, chunkRowids[i]);
+        if (rc != SQLITE_OK)
+          goto cleanup;
+      }
+    }
+  }
+
+  qsort(out_map->rowids, out_map->count, sizeof(i64), cmp_i64);
+
+cleanup:
+  for (int i = 0; i < VEC0_MAX_METADATA_COLUMNS; i++)
+  {
+    sqlite3_blob_close(metadataBlobs[i]);
+  }
+  sqlite3_free(b);
+  sqlite3_free(bmRowids);
+  sqlite3_free(bmMetadata);
+  return rc;
 }
