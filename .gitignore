@@ -1,19 +1,26 @@
-/target
-.vscode
-sift/
+# SQL, shared objects, build artifacts
+*.sql
+*.so
+*.out
 *.tar.gz
 *.db
+*.db-journal
 *.npy
 *.bin
-*.out
-venv/
 
+# IDE / editor
+.vscode/
+
+# Python / virtualenv
+venv/
+*.pyc
+poetry.lock
+
+# Folders to ignore
+sift/
 vendor/
 dist/
-
-*.pyc
-*.db-journal
-
+tmp/
 alexandria/
 openai/
 examples/supabase-dbpedia
@@ -22,12 +29,10 @@ examples/dbpedia-openai
 examples/imdb
 examples/sotu
 
+# Specific files
 sqlite-vec.h
-tmp/
-
-poetry.lock
-
-*.jsonl
-
 memstat.c
 memstat.*
+
+# JSON data
+*.jsonl
