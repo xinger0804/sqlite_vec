@@ -4199,6 +4199,8 @@ typedef struct
   i64 *rowids;
   int capacity;
   int count;
+
+  bool pre_filter; // 是否开启：前过滤
 } RowidMap;
 
 static int cmp_i64(const void *a, const void *b)
@@ -4603,6 +4605,13 @@ void vec0_free(vec0_vtab *p)
     else if (p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_IVF)
     {
       ivf_free(p->indexMeta->indexIVF);
+    }
+    else if (p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_HYBRID)
+    {
+      if (p->indexMeta->indexTree)
+      {
+        kdtree_free(p->indexMeta->indexTree->root);
+      }
     }
     sqlite3_free(p->indexMeta);
   }
@@ -6061,7 +6070,7 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
         {
           pNew->indexMeta->indexType = SQLITE_VEC0_INDEX_TYPE_IVF;
         }
-        else if (sqlite3_strnicmp(key, "create_hybrid_index", keyLength) == 0)
+        else if (sqlite3_strnicmp(key, "create_index_hybrid", keyLength) == 0)
         {
           pNew->indexMeta->indexType = SQLITE_VEC0_INDEX_TYPE_HYBRID;
         }
@@ -6487,6 +6496,18 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
           goto error;
         }
         break;
+      case SQLITE_VEC0_INDEX_TYPE_HYBRID:
+        pNew->indexMeta->indexTree = sqlite3_malloc(sizeof(struct KDTree));
+        if (!pNew->indexMeta->indexTree)
+        {
+          rc = SQLITE_NOMEM;
+          goto error;
+        }
+        pNew->indexMeta->indexTree->root = NULL;
+        pNew->indexMeta->indexTree->dimensions = pNew->vector_columns[numVectorColumns - 1].dimensions;
+        pNew->indexMeta->indexTree->size = 0;
+        break;
+        break;
       }
     }
   }
@@ -6519,6 +6540,15 @@ static int vec0_init(sqlite3 *db, void *pAux, int argc, const char *const *argv,
       snprintf(indexname, sizeof(indexname), "%s_%s_%s.idx", dbname, pNew->tableName, "ivf");
       pNew->indexMeta->indexIVF = deserialize_ivf(indexname);
       if (!pNew->indexMeta->indexIVF)
+      {
+        pNew->hasIndex = false;
+      }
+      break;
+    case SQLITE_VEC0_INDEX_TYPE_HYBRID:
+
+      snprintf(indexname, sizeof(indexname), "%s_%s_%s.idx", dbname, pNew->tableName, "kdtree");
+      pNew->indexMeta->indexTree = deserialize_kdtree(indexname);
+      if (!pNew->indexMeta->indexTree)
       {
         pNew->hasIndex = false;
       }
@@ -6590,6 +6620,16 @@ static int vec0Disconnect(sqlite3_vtab *pVtab)
       if (rc != SQLITE_OK)
       {
         vtab_set_error(pVtab, "could not serialize ivf");
+      }
+      break;
+    }
+    case SQLITE_VEC0_INDEX_TYPE_HYBRID:
+    {
+      snprintf(indexname, sizeof(indexname), "%s_%s_%s.idx", dbname, p->tableName, "kdtree");
+      int rc = serialize_kdtree(p->indexMeta->indexTree, indexname);
+      if (rc != SQLITE_OK)
+      {
+        vtab_set_error(pVtab, "could not serialize kdtree");
       }
       break;
     }
@@ -8847,6 +8887,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     out_map->capacity = 16; // 初始化值，在add函数中动态扩容。
     out_map->count = 0;
     out_map->rowids = sqlite3_malloc(sizeof(i64) * out_map->capacity);
+    out_map->pre_filter = p->indexMeta->indexType != SQLITE_VEC0_INDEX_TYPE_HYBRID;
     if (!out_map->rowids)
     {
       rc = SQLITE_NOMEM;
@@ -8866,6 +8907,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
 
     switch (p->indexMeta->indexType)
     {
+    case SQLITE_VEC0_INDEX_TYPE_HYBRID:
     case SQLITE_VEC0_INDEX_TYPE_KDTREE:
     {
       i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
@@ -10459,8 +10501,14 @@ int vec0Update_Insert(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv,
       {
         float *vecData = (float *)vectorDatas[i];
         int dim = p->vector_columns[i].dimensions;
-        if (p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_KDTREE)
+        if (p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_HYBRID)
+        {
           rc = kdtree_insert(p->indexMeta->indexTree, vecData, rowid, dim);
+        }
+        if (p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_KDTREE)
+        {
+          rc = kdtree_insert(p->indexMeta->indexTree, vecData, rowid, dim);
+        }
         if (p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_HNSW)
         {
           rc = hnsw_add(p->indexMeta->indexHNSW, vecData, rowid, p->indexMeta->distfunc);
@@ -10832,6 +10880,7 @@ int vec0Update_Delete(sqlite3_vtab *pVTab, sqlite3_value *idValue)
     {
       switch (p->indexMeta->indexType)
       {
+      case SQLITE_VEC0_INDEX_TYPE_HYBRID:
       case SQLITE_VEC0_INDEX_TYPE_KDTREE:
         rc = kdtree_delete(p->indexMeta->indexTree, rowid);
         break;
@@ -11077,6 +11126,7 @@ int vec0Update_Update(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv)
       case SQLITE_VEC0_INDEX_TYPE_HNSW:
         hnsw_update(p->indexMeta->indexHNSW, rowid, vec, true, p->indexMeta->distfunc);
         break;
+      case SQLITE_VEC0_INDEX_TYPE_HYBRID:
       case SQLITE_VEC0_INDEX_TYPE_KDTREE:
         kdtree_update(p->indexMeta->indexTree, rowid, vec, p->indexMeta->dim);
         break;
@@ -12351,7 +12401,7 @@ void kdtree_search_topk_rec(KDNode *node, const float *query, int dims,
     float dist2 = distfunc(query, node->point, &dims_t);
     // 检查 rowid 是否在 map 中
     int valid = bsearch(&node->rowid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
-    if (valid)
+    if (!map->pre_filter || valid)
       topk_insert(rowids, dists, k_used, k, node->rowid, dist2);
   }
 
@@ -12777,7 +12827,7 @@ int hnsw_search(HNSW *h, const f32 *query, int ef, i64 *out_ids, f32 *out_dists,
   {
     HNSWNode *n = h->nodes[q[qh++]];
     int valid = bsearch(&n->rowid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
-    if (!n->deleted && valid)
+    if (!n->deleted && (valid || !map->pre_filter))
     {
       f32 d = dist_func(n->vec, query, &h->dim);
       out_ids[results] = n->rowid;
@@ -13195,7 +13245,7 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
 
       i64 rid = lst->rowids[j];
       int valid = bsearch(&rid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
-      if (!valid)
+      if (!valid && map->pre_filter)
         continue;
 
       const f32 *v = &lst->vecs[(size_t)j * dim];
