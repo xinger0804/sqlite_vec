@@ -8835,119 +8835,129 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     goto cleanup;
   }
 
-  RowidMap *out_map;
-  out_map = sqlite3_malloc(sizeof(RowidMap));
-  if (!out_map)
+  if (p->hasIndex)
   {
-    rc = SQLITE_NOMEM;
-    goto cleanup;
-  }
-  out_map->capacity = 16; // 初始化值，在add函数中动态扩容。
-  out_map->count = 0;
-  out_map->rowids = sqlite3_malloc(sizeof(i64) * out_map->capacity);
-  if (!out_map->rowids)
-  {
-    rc = SQLITE_NOMEM;
-    goto cleanup;
-  }
-  rc = vec0Filter_chunks_to_rowid_map(p, stmtChunks, arrayRowidsIn, aMetadataIn, idxStr, argc, argv, out_map);
-
-  // for (int i = 0; i < out_map->count; i++)
-  // {
-  //   printf("[%d](%lld)", i, out_map->rowids[i]);
-  // }
-  if (rc != SQLITE_OK && rc != SQLITE_DONE)
-  {
-    goto cleanup;
-  }
-
-  if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_KDTREE)
-  {
-    i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
-    f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
-    if (!topk_rowids || !topk_distances)
+    RowidMap *out_map;
+    out_map = sqlite3_malloc(sizeof(RowidMap));
+    if (!out_map)
     {
       rc = SQLITE_NOMEM;
       goto cleanup;
     }
-
-    int n_found = kdtree_topk(p->indexMeta->indexTree, queryVector, k,
-                              topk_rowids, topk_distances, out_map, p->indexMeta->distfunc);
-
-    knn_data->current_idx = 0;
-    knn_data->k = k;
-    knn_data->k_used = n_found;
-    knn_data->rowids = topk_rowids;
-    knn_data->distances = topk_distances;
-
-    pCur->knn_data = knn_data;
-    pCur->query_plan = VEC0_QUERY_PLAN_KNN;
-    rc = SQLITE_OK;
-    goto cleanup;
-  }
-  else if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_HNSW)
-  {
-    i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * EF_CONSTRUCTION);
-    f32 *topk_distances = sqlite3_malloc(sizeof(f32) * EF_CONSTRUCTION);
-    if (!topk_rowids || !topk_distances)
+    out_map->capacity = 16; // 初始化值，在add函数中动态扩容。
+    out_map->count = 0;
+    out_map->rowids = sqlite3_malloc(sizeof(i64) * out_map->capacity);
+    if (!out_map->rowids)
     {
       rc = SQLITE_NOMEM;
       goto cleanup;
     }
+    rc = vec0Filter_chunks_to_rowid_map(p, stmtChunks, arrayRowidsIn, aMetadataIn, idxStr, argc, argv, out_map);
 
-    int n_found = hnsw_search(p->indexMeta->indexHNSW,
-                              (f32 *)queryVector,
-                              EF_CONSTRUCTION,
-                              topk_rowids,
-                              topk_distances,
-                              k,
-                              out_map,
-                              p->indexMeta->distfunc);
+    // for (int i = 0; i < out_map->count; i++)
+    // {
+    //   printf("[%d](%lld)", i, out_map->rowids[i]);
+    // }
 
-    knn_data->current_idx = 0;
-    knn_data->k = k;
-    knn_data->k_used = n_found;
-    knn_data->rowids = topk_rowids;
-    knn_data->distances = topk_distances;
-
-    pCur->knn_data = knn_data;
-    pCur->query_plan = VEC0_QUERY_PLAN_KNN;
-    rc = SQLITE_OK;
-    goto cleanup;
-  }
-  else if (p->hasIndex && p->indexMeta->indexType == SQLITE_VEC0_INDEX_TYPE_IVF)
-  {
-
-    i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
-    f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
-    if (!topk_rowids || !topk_distances)
+    if (rc != SQLITE_OK && rc != SQLITE_DONE)
     {
-      rc = SQLITE_NOMEM;
       goto cleanup;
     }
 
-    // 2. IVF 搜索
-    int n_found = ivf_search(
-        p->indexMeta->indexIVF,
-        (f32 *)queryVector,
-        k,
-        IVF_N_PROBE,
-        topk_rowids,
-        topk_distances,
-        out_map,
-        p->indexMeta->distfunc);
+    switch (p->indexMeta->indexType)
+    {
+    case SQLITE_VEC0_INDEX_TYPE_KDTREE:
+    {
+      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
+      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
+      if (!topk_rowids || !topk_distances)
+      {
+        rc = SQLITE_NOMEM;
+        goto cleanup;
+      }
 
-    knn_data->current_idx = 0;
-    knn_data->k = k;
-    knn_data->k_used = n_found;
-    knn_data->rowids = topk_rowids;
-    knn_data->distances = topk_distances;
+      int n_found = kdtree_topk(p->indexMeta->indexTree, queryVector, k,
+                                topk_rowids, topk_distances, out_map, p->indexMeta->distfunc);
 
-    pCur->knn_data = knn_data;
-    pCur->query_plan = VEC0_QUERY_PLAN_KNN;
+      knn_data->current_idx = 0;
+      knn_data->k = k;
+      knn_data->k_used = n_found;
+      knn_data->rowids = topk_rowids;
+      knn_data->distances = topk_distances;
 
-    rc = SQLITE_OK;
-    goto cleanup;
+      pCur->knn_data = knn_data;
+      pCur->query_plan = VEC0_QUERY_PLAN_KNN;
+      rc = SQLITE_OK;
+      goto cleanup;
+      break;
+    }
+    case SQLITE_VEC0_INDEX_TYPE_HNSW:
+    {
+      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * EF_CONSTRUCTION);
+      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * EF_CONSTRUCTION);
+      if (!topk_rowids || !topk_distances)
+      {
+        rc = SQLITE_NOMEM;
+        goto cleanup;
+      }
+
+      int n_found = hnsw_search(p->indexMeta->indexHNSW,
+                                (f32 *)queryVector,
+                                EF_CONSTRUCTION,
+                                topk_rowids,
+                                topk_distances,
+                                k,
+                                out_map,
+                                p->indexMeta->distfunc);
+
+      knn_data->current_idx = 0;
+      knn_data->k = k;
+      knn_data->k_used = n_found;
+      knn_data->rowids = topk_rowids;
+      knn_data->distances = topk_distances;
+
+      pCur->knn_data = knn_data;
+      pCur->query_plan = VEC0_QUERY_PLAN_KNN;
+      rc = SQLITE_OK;
+      goto cleanup;
+      break;
+    }
+    case SQLITE_VEC0_INDEX_TYPE_IVF:
+    {
+      i64 *topk_rowids = sqlite3_malloc(sizeof(i64) * k);
+      f32 *topk_distances = sqlite3_malloc(sizeof(f32) * k);
+      if (!topk_rowids || !topk_distances)
+      {
+        rc = SQLITE_NOMEM;
+        goto cleanup;
+      }
+
+      int n_found = ivf_search(
+          p->indexMeta->indexIVF,
+          (f32 *)queryVector,
+          k,
+          IVF_N_PROBE,
+          topk_rowids,
+          topk_distances,
+          out_map,
+          p->indexMeta->distfunc);
+
+      knn_data->current_idx = 0;
+      knn_data->k = k;
+      knn_data->k_used = n_found;
+      knn_data->rowids = topk_rowids;
+      knn_data->distances = topk_distances;
+
+      pCur->knn_data = knn_data;
+      pCur->query_plan = VEC0_QUERY_PLAN_KNN;
+
+      rc = SQLITE_OK;
+      goto cleanup;
+      break;
+    }
+    default:
+      break;
+    }
   }
   else
   {
@@ -8972,6 +8982,7 @@ int vec0Filter_knn(vec0_cursor *pCur, vec0_vtab *p, int idxNum,
     pCur->knn_data = knn_data;
     pCur->query_plan = VEC0_QUERY_PLAN_KNN;
     rc = SQLITE_OK;
+    goto cleanup;
   }
 
 cleanup:
@@ -13181,7 +13192,7 @@ int ivf_search(IVF *ivf, const f32 *query, int topk, int nprobe_override, i64 *o
 
     for (int j = 0; j < lst->count; j++)
     {
-      
+
       i64 rid = lst->rowids[j];
       int valid = bsearch(&rid, map->rowids, map->count, sizeof(i64), cmp_i64) != NULL;
       if (!valid)
